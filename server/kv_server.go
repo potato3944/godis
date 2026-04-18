@@ -1,8 +1,6 @@
 package server
 
 import (
-	"log"
-	"net"
 	"net/rpc"
 
 	"predis/api"
@@ -13,11 +11,11 @@ import (
 // KVServer 包装了存储引擎，提供基于 net/rpc 的外部访问
 type KVServer struct {
 	store   store.Store
-	cluster *cluster.StaticCluster
+	cluster *cluster.ClusterState
 }
 
-// NewKVServer 初始化 RPC 服务器，引入 Cluster 拓扑支持
-func NewKVServer(s store.Store, c *cluster.StaticCluster) *KVServer {
+// NewKVServer 初始化 RPC 服务器，引入动态 Gossip 集群状态
+func NewKVServer(s store.Store, c *cluster.ClusterState) *KVServer {
 	return &KVServer{
 		store:   s,
 		cluster: c,
@@ -30,14 +28,14 @@ func (kv *KVServer) checkSlot(key string, header *api.ReplyHeader) bool {
 	if kv.cluster == nil {
 		return true // 单机模式降级运行
 	}
-	
+
 	isMine, ownerAddr := kv.cluster.IsMine(key)
 	if !isMine {
 		header.Redirect = true
 		header.RedirectAddr = ownerAddr
 		return false
 	}
-	
+
 	return true
 }
 
@@ -75,30 +73,7 @@ func (kv *KVServer) Delete(args *api.DeleteArgs, reply *api.DeleteReply) error {
 	return nil
 }
 
-// Start 启动 RPC 服务端并在指定的地址监听
-func (kv *KVServer) Start(address string) error {
-	err := rpc.Register(kv)
-	if err != nil {
-		return err
-	}
-
-	listener, err := net.Listen("tcp", address)
-	if err != nil {
-		return err
-	}
-
-	log.Printf("KV RPC Server runing at [%s] on distributed mode.\n", address)
-
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				log.Printf("Accept error: %v", err)
-				continue
-			}
-			go rpc.ServeConn(conn)
-		}
-	}()
-
-	return nil
+// Register 将 KVServer 挂载到默认的 RPC 路由器上
+func (kv *KVServer) Register() error {
+	return rpc.Register(kv)
 }

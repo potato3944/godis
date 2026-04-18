@@ -40,3 +40,28 @@ type DeleteReply struct {
 	ReplyHeader
 	Success bool
 }
+
+type PingArgs struct {
+	NodeId string
+	Epoch  int
+	Slots  [2048]byte
+}
+
+type PingReply struct {
+	NodeId string
+	Epoch  int
+	Slots  [2048]byte
+}
+
+// MeetArgs 定义节点加入请求的参数
+type MeetArgs struct {
+	NodeId string
+	Addr   string // 新节点的通信地址
+}
+
+// MeetReply 定义节点加入请求的返回值
+type MeetReply struct {
+	NodeId  string
+	Addr    string // 接收节点的通信地址
+	Success bool
+}

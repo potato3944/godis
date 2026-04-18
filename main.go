@@ -3,7 +3,8 @@ package main
 import (
 	"flag"
 	"log"
-	"strings"
+	"net"
+	"net/rpc"
 
 	"predis/cluster"
 	"predis/server"
@@ -11,30 +12,59 @@ import (
 )
 
 func main() {
-	// 通过命令行参数支持集群节点的注入与分配
-	// 例如测试时可用:  go run main.go -addr=":1234" -nodes=":1234,:1235,:1236"
-	addr := flag.String("addr", ":1234", "Current node's address (e.g. :1234)")
-	nodesStr := flag.String("nodes", ":1234", "Comma separated list of all cluster nodes")
+	addr := flag.String("addr", ":1234", "本节点的网络监听地址 (e.g. :1234)")
+	nodeId := flag.String("id", "node1", "本节点的唯一身份标识 (e.g. node1)")
+	joinAddr := flag.String("join", "", "你想拉手合并的现有 Gossip 节点地址")
 	flag.Parse()
 
-	allNodes := strings.Split(*nodesStr, ",")
-
-	// 1. 初始化底层线程安全的物理存储
+	// 1. 初始化底层引擎
 	engine := store.NewConcurrentMap()
 
-	// 2. 初始化分布式集群拓扑管理器，并分配 16384 槽的哈希环位
-	staticCluster := cluster.NewStaticCluster(*addr, allNodes)
-	log.Printf("Cluster mapping initialized with %d nodes", len(allNodes))
+	// 2. 初始化核心动态集群状态机
+	clusterState := cluster.NewClusterState(*nodeId, *addr)
 
-	// 3. 将存储引擎与集群信息注入到 RPC server 环境中
-	rpcServer := server.NewKVServer(engine, staticCluster)
-
-	// 4. 在自身绑定的地址上启动监听
-	err := rpcServer.Start(*addr)
-	if err != nil {
-		log.Fatalf("Failed to start server: %v", err)
+	// 3. 作为创世节点的话，要宣告所有槽位主权
+	if *joinAddr == "" {
+		clusterState.ClaimAllSlots()
+		log.Printf("Starting as Seed Node [%s], claiming all slots.", *nodeId)
 	}
 
-	// 阻塞主线程以保持服务实例在线
+	// 4. 初始化两大对外服务： Gossip 节点协同服务 和 KV 查询服务
+	gossipServer := server.NewGossipServer(clusterState)
+	kvServer := server.NewKVServer(engine, clusterState)
+
+	// 把两个服务注册到原生 rpc 的基础单例复用路由器上
+	gossipServer.Register()
+	kvServer.Register()
+
+	// 5. 启动网络监听，同时接待 Redis 操作和群内部聊天
+	listener, err := net.Listen("tcp", *addr)
+	if err != nil {
+		log.Fatalf("Listen error: %v", err)
+	}
+	log.Printf("Predis Network listening on [%s] - Node ID: %s", *addr, *nodeId)
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				continue
+			}
+			go rpc.ServeConn(conn)
+		}
+	}()
+
+	// 6. 连结外部网络后再启动心跳，防止先发后至
+	clusterState.StartHeart()
+
+	// 7. 如果配置了目标，发起拉手请求获取其它节点的拓扑！
+	if *joinAddr != "" {
+		err := gossipServer.JoinCluster(*joinAddr)
+		if err != nil {
+			log.Fatalf("Failed to Join cluster at %s: %v", *joinAddr, err)
+		}
+	}
+
+	// 阻塞主线程
 	select {}
 }

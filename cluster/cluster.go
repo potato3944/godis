@@ -61,10 +61,32 @@ func (cs *ClusterState) IsMine(key string) (bool, string) {
 }
 
 // 发起 rpc
-func (cs *ClusterState) ClusterSendPing(nodeId string, typ int) {
-	cs.mu.RLock()
+func (cs *ClusterState) ClusterSendPing(target *ClusterNode, typ api.PingType) {
 
-	target := cs.Nodes[nodeId]
+	args := cs.PreparePingArgs(target, typ)
+	target.mu.Lock()
+	client := target.RpcClient
+	if client == nil {
+		newClient, err := rpc.Dial("tcp", target.Addr)
+		if err != nil {
+			log.Printf("Dial target %s failed: %v\n", target.Addr, err)
+			return
+		}
+		target.RpcClient = newClient
+		client = newClient
+	}
+	target.mu.Unlock()
+	// 发起异步 RPC 调用
+	reply := &api.PingArgs{}
+	err := client.Call("GossipServer.Ping", args, reply)
+	if err != nil {
+		log.Println(err)
+	}
+
+}
+
+func (cs *ClusterState) PreparePingArgs(target *ClusterNode, typ api.PingType) (args *api.PingArgs) {
+	cs.mu.RLock()
 
 	freshnodes := len(cs.Nodes) - 2
 	wanted := min(max(len(cs.Nodes)/10, 3), freshnodes)
@@ -92,34 +114,38 @@ func (cs *ClusterState) ClusterSendPing(nodeId string, typ int) {
 		freshnodes--
 		gossipCount++
 	}
-	args := &api.PingArgs{
+	args = &api.PingArgs{
 		NodeId:     cs.Myself.NodeId,
 		Slots:      [2048]byte(cs.Myself.Slots),
 		Type:       typ,
 		KnownNodes: knownNodes,
 	}
 	cs.mu.RUnlock()
-
-	target.mu.Lock()
-	client := target.RpcClient
-	if client == nil {
-		newClient, err := rpc.Dial("tcp", target.Addr)
-		if err != nil {
-			log.Printf("Dial target %s failed: %v\n", target.Addr, err)
-			return
-		}
-		target.RpcClient = newClient
-		client = newClient
-	}
-	target.mu.Unlock()
-	// 发起异步 RPC 调用
-	client.Go("GossipServer.Ping", args, &api.PingReply{}, nil)
+	return
 }
 
 // 处理 rpc
-func (cs *ClusterState) ProcessPing(args *api.PingArgs, reply *api.PingReply) {
-	go cs.ClusterSendPing(args.NodeId, api.PingType_Pong)
-	go cs.ProcessGossipNodeInfo(args.KnownNodes)
+func (cs *ClusterState) ProcessPing(args *api.PingArgs, reply *api.PingArgs) {
+	cs.mu.RLock()
+	target,ok := cs.Nodes[args.NodeId]
+	cs.mu.RUnlock()
+	if args.Type == api.PingType_Ping || args.Type == api.PintType_Meet {
+		reply = cs.PreparePingArgs(target, api.PingType_Pong)
+	}
+	if !ok && args.Type == api.PintType_Meet {
+
+		cs.Nodes[args.NodeId] = &ClusterNode{
+			NodeId: args.NodeId,
+			Addr:   args.Addr,
+		}
+		cs.NodesKeys = append(cs.NodesKeys, args.NodeId)
+		go cs.ProcessGossipNodeInfo(args.KnownNodes)
+
+	}
+
+	if ok {
+		go cs.ProcessGossipNodeInfo(args.KnownNodes)
+	}
 }
 func (cs *ClusterState) ProcessGossipNodeInfo(nodes []api.GossipNodeInfo) {
 	cs.mu.Lock()
@@ -129,9 +155,10 @@ func (cs *ClusterState) ProcessGossipNodeInfo(nodes []api.GossipNodeInfo) {
 				NodeId: node.NodeId,
 				Addr:   node.Addr,
 			}
+			cs.NodesKeys = append(cs.NodesKeys, node.NodeId)
 		}
 	}
-
+	cs.mu.Unlock()
 }
 
 // GetRandomNode 从所有节点中随机获取一个节点

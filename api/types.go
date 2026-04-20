@@ -47,35 +47,18 @@ type GossipNodeInfo struct {
 	Addr   string
 }
 
+type PingType int
+
 const (
-	PingType_Ping = 0
-	PingType_Pong = 1
-	PintType_Meet = 2
+	PingType_Ping PingType = iota
+	PingType_Pong
+	PintType_Meet
 )
 
 type PingArgs struct {
 	NodeId     string
+	Addr       string
 	Slots      [2048]byte
-	Type       int
+	Type       PingType
 	KnownNodes []GossipNodeInfo // 这就是 hdr->data.ping.gossip
-}
-
-type PingReply struct {
-	NodeId     string
-	Slots      [2048]byte
-	Type       int
-	KnownNodes []GossipNodeInfo
-}
-
-// MeetArgs 定义节点加入请求的参数
-type MeetArgs struct {
-	NodeId string
-	Addr   string // 新节点的通信地址
-}
-
-// MeetReply 定义节点加入请求的返回值
-type MeetReply struct {
-	NodeId  string
-	Addr    string // 接收节点的通信地址
-	Success bool
 }

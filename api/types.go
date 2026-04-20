@@ -41,17 +41,19 @@ type DeleteReply struct {
 	Success bool
 }
 
-type PingArgs struct {
+// 对应 C 的 clusterMsgDataGossip
+type GossipNodeInfo struct {
 	NodeId string
-	Epoch  int
-	Slots  [2048]byte
+	Addr   string
 }
 
-type PingReply struct {
-	NodeId string
-	Epoch  int
-	Slots  [2048]byte
+type PingArgs struct {
+	NodeId     string
+	Slots      [2048]byte
+	KnownNodes []GossipNodeInfo // 这就是 hdr->data.ping.gossip
 }
+
+type PingReply struct{}
 
 // MeetArgs 定义节点加入请求的参数
 type MeetArgs struct {

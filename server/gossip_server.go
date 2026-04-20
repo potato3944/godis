@@ -24,15 +24,15 @@ func (gs *GossipServer) Ping(args *api.PingArgs, reply *api.PingReply) error {
 	gs.mu.Lock()
 	defer gs.mu.Unlock()
 
-	reply.NodeId = gs.cluster.SelfNode.NodeId
-	reply.Epoch = gs.cluster.SelfNode.Epoch
-	reply.Slots = [2048]byte(gs.cluster.SelfNode.Slots)
+	reply.NodeId = gs.cluster.Myself.NodeId
+	reply.Epoch = gs.cluster.Myself.Epoch
+	reply.Slots = [2048]byte(gs.cluster.Myself.Slots)
 
 	// 1. 检查对方的 Epoch 是否比自己新
-	if args.Epoch > gs.cluster.SelfNode.Epoch {
+	if args.Epoch > gs.cluster.Myself.Epoch {
 		// 对方的认知更新，立即同步
-		gs.cluster.SelfNode.Epoch = args.Epoch
-		gs.cluster.SelfNode.Slots = cluster.BitMap(args.Slots)
+		gs.cluster.Myself.Epoch = args.Epoch
+		gs.cluster.Myself.Slots = cluster.BitMap(args.Slots)
 	}
 
 	log.Printf("[Gossip] 收到来自 %s 的 PING 请求，正在回复 PONG...", args.NodeId)
@@ -46,7 +46,7 @@ func (gs *GossipServer) Meet(args *api.MeetArgs, reply *api.MeetReply) error {
 
 	// 1. 如果节点不在本地认知拓扑中，将其加入
 	if _, exists := gs.cluster.Nodes[args.NodeId]; !exists {
-		gs.cluster.Nodes[args.NodeId] = cluster.Node{
+		gs.cluster.Nodes[args.NodeId] = cluster.ClusterNode{
 			NodeId: args.NodeId,
 			Addr:   args.Addr,
 			Flag:   1, // 譬如定义 1 为在线活跃状态
@@ -58,8 +58,8 @@ func (gs *GossipServer) Meet(args *api.MeetArgs, reply *api.MeetReply) error {
 	}
 
 	// 2. 作为响应，本节点将自身数据交给对方，供对方的路由表注册
-	reply.NodeId = gs.cluster.SelfNode.NodeId
-	reply.Addr = gs.cluster.SelfNode.Addr
+	reply.NodeId = gs.cluster.Myself.NodeId
+	reply.Addr = gs.cluster.Myself.Addr
 	reply.Success = true
 
 	return nil
@@ -80,8 +80,8 @@ func (gs *GossipServer) JoinCluster(targetAddr string) error {
 
 	gs.mu.RLock()
 	args := &api.MeetArgs{
-		NodeId: gs.cluster.SelfNode.NodeId,
-		Addr:   gs.cluster.SelfNode.Addr, // 必须是外部能访问自己 Gossip 的地址
+		NodeId: gs.cluster.Myself.NodeId,
+		Addr:   gs.cluster.Myself.Addr, // 必须是外部能访问自己 Gossip 的地址
 	}
 	gs.mu.RUnlock()
 
@@ -95,7 +95,7 @@ func (gs *GossipServer) JoinCluster(targetAddr string) error {
 		gs.mu.Lock()
 		// 如果本地未记录目标节点，则将其添加
 		if _, exists := gs.cluster.Nodes[reply.NodeId]; !exists {
-			gs.cluster.Nodes[reply.NodeId] = cluster.Node{
+			gs.cluster.Nodes[reply.NodeId] = cluster.ClusterNode{
 				NodeId: reply.NodeId,
 				Addr:   reply.Addr,
 				Flag:   1,

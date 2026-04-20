@@ -2,7 +2,9 @@ package cluster
 
 import (
 	"hash/crc32"
+	"log"
 	"math/rand"
+	"net/rpc"
 	"sync"
 
 	"predis/api"
@@ -13,9 +15,11 @@ const NumSlots = 16384
 type BitMap [2048]byte
 
 type ClusterNode struct {
-	NodeId string
-	Addr   string
-	Slots  BitMap
+	mu        sync.RWMutex
+	NodeId    string
+	Addr      string
+	Slots     BitMap
+	RpcClient *rpc.Client
 }
 
 type ClusterState struct {
@@ -56,18 +60,14 @@ func (cs *ClusterState) IsMine(key string) (bool, string) {
 	return true, ""
 }
 
-func (cs *ClusterState) ClusterSendPing(target *ClusterNode) {
+// 发起 rpc
+func (cs *ClusterState) ClusterSendPing(nodeId string, typ int) {
 	cs.mu.RLock()
-	defer cs.mu.RUnlock()
+
+	target := cs.Nodes[nodeId]
 
 	freshnodes := len(cs.Nodes) - 2
-	wanted := len(cs.Nodes) / 10
-	if wanted < 3 {
-		wanted = 3
-	}
-	if wanted > freshnodes {
-		wanted = freshnodes
-	}
+	wanted := min(max(len(cs.Nodes)/10, 3), freshnodes)
 
 	maxIteration := wanted * 3
 	gossipCount := 0
@@ -95,9 +95,43 @@ func (cs *ClusterState) ClusterSendPing(target *ClusterNode) {
 	args := &api.PingArgs{
 		NodeId:     cs.Myself.NodeId,
 		Slots:      [2048]byte(cs.Myself.Slots),
+		Type:       typ,
 		KnownNodes: knownNodes,
 	}
-all("GossipServer.Ping", target.Addr, args, &api.PingReply{})
+	cs.mu.RUnlock()
+
+	target.mu.Lock()
+	client := target.RpcClient
+	if client == nil {
+		newClient, err := rpc.Dial("tcp", target.Addr)
+		if err != nil {
+			log.Printf("Dial target %s failed: %v\n", target.Addr, err)
+			return
+		}
+		target.RpcClient = newClient
+		client = newClient
+	}
+	target.mu.Unlock()
+	// 发起异步 RPC 调用
+	client.Go("GossipServer.Ping", args, &api.PingReply{}, nil)
+}
+
+// 处理 rpc
+func (cs *ClusterState) ProcessPing(args *api.PingArgs, reply *api.PingReply) {
+	go cs.ClusterSendPing(args.NodeId, api.PingType_Pong)
+	go cs.ProcessGossipNodeInfo(args.KnownNodes)
+}
+func (cs *ClusterState) ProcessGossipNodeInfo(nodes []api.GossipNodeInfo) {
+	cs.mu.Lock()
+	for _, node := range nodes {
+		if _, ok := cs.Nodes[node.NodeId]; !ok {
+			cs.Nodes[node.NodeId] = &ClusterNode{
+				NodeId: node.NodeId,
+				Addr:   node.Addr,
+			}
+		}
+	}
+
 }
 
 // GetRandomNode 从所有节点中随机获取一个节点

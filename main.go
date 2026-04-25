@@ -15,10 +15,12 @@ func main() {
 	addr := flag.String("addr", ":1234", "本节点的网络监听地址 (e.g. :1234)")
 	nodeId := flag.String("id", "node1", "本节点的唯一身份标识 (e.g. node1)")
 	joinAddr := flag.String("join", "", "你想拉手合并的现有 Gossip 节点地址")
+	maxEntries := flag.Int("max-entries", 0, "最大元素数量 (0 表示不限制)")
+	policy := flag.String("policy", "LRU", "淘汰策略 (LRU, FIFO, NONE)")
 	flag.Parse()
 
 	// 1. 初始化底层引擎
-	engine := store.NewConcurrentMap()
+	engine := store.NewConcurrentMap(*maxEntries, store.EvictionPolicyType(*policy))
 
 	// 2. 初始化核心动态集群状态机
 	clusterState := cluster.NewClusterState(*nodeId, *addr)

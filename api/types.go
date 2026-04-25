@@ -56,9 +56,44 @@ const (
 )
 
 type PingArgs struct {
-	NodeId     string
-	Addr       string
-	Slots      [2048]byte
-	Type       PingType
-	KnownNodes []GossipNodeInfo // 这就是 hdr->data.ping.gossip
+	NodeId       string
+	Addr         string
+	Slots        [2048]byte
+	ConfigEpoch  uint64
+	CurrentEpoch uint64
+	Type         PingType
+	KnownNodes   []GossipNodeInfo // 这就是 hdr->data.ping.gossip
+}
+
+type SetSlotAction int
+
+const (
+	SetSlotAction_Migrate SetSlotAction = iota
+	SetSlotAction_Import
+	SetSlotAction_Node
+)
+
+type SetSlotArgs struct {
+	Action       SetSlotAction
+	TargetNodeId string
+	Slot         uint
+}
+
+type MigrateKeysArgs struct {
+	NodeId string
+	Addr   string
+	Key    string
+}
+
+type MigrateKeysReply struct {
+	Success bool
+}
+
+type RestoreArgs struct {
+	Key   string
+	Value string
+}
+
+type RestoreReply struct {
+	Success bool
 }

@@ -76,35 +76,57 @@ func (cs *ClusterState) IsMine(key string) (bool, string) {
 }
 
 // 发起 rpc
-func (cs *ClusterState) ClusterSendPing(target *ClusterNode, typ api.PingType) {
-
-	args := cs.PreparePingArgs(target, typ)
-	target.mu.Lock()
-	client := target.RpcClient
+func (cs *ClusterState) ClusterSendPing(receiver *ClusterNode, typ api.PingType) {
+	args := cs.PreparePingArgs(receiver, typ)
+	receiver.mu.Lock()
+	client := receiver.RpcClient
 	if client == nil {
-		newClient, err := rpc.Dial("tcp", target.Addr)
+		newClient, err := rpc.Dial("tcp", receiver.Addr)
 		if err != nil {
-			log.Printf("Dial target %s failed: %v\n", target.Addr, err)
+			log.Printf("Dial target %s failed: %v\n", receiver.Addr, err)
+			receiver.mu.Unlock()
 			return
 		}
-		target.RpcClient = newClient
+		receiver.RpcClient = newClient
 		client = newClient
 	}
-	target.mu.Unlock()
+	receiver.mu.Unlock()
 	// 发起异步 RPC 调用
 	reply := &api.PingArgs{}
 	err := client.Call("GossipServer.Ping", args, reply)
 	if err != nil {
 		log.Println(err)
-	} else {
-		go cs.ClusterProcessConfigInfo(args, cs.Nodes[reply.NodeId])
-		go cs.ProcessGossipNodeInfo(args.KnownNodes)
+		return
 	}
-	//Todo 处理 reply
+	cs.mu.RLock()
+	sender := cs.Nodes[args.NodeId]
+	cs.mu.RUnlock()
+
+	cs.ProcessPacket(args, sender)
 
 }
 
-func (cs *ClusterState) PreparePingArgs(target *ClusterNode, typ api.PingType) (args *api.PingArgs) {
+func (cs *ClusterState) ProcessPacket(args *api.PingArgs, sender *ClusterNode) {
+
+	if sender == nil && args.Type == api.PintType_Meet {
+
+		cs.Nodes[args.NodeId] = &ClusterNode{
+			NodeId: args.NodeId,
+			Addr:   args.Addr,
+		}
+		cs.NodesIds = append(cs.NodesIds, args.NodeId)
+		go cs.ProcessGossipNodeInfo(args.KnownNodes)
+		return
+
+	}
+
+	if sender != nil {
+		go cs.ClusterProcessConfigInfo(args, sender)
+		go cs.ProcessGossipNodeInfo(args.KnownNodes)
+	}
+}
+
+func (cs *ClusterState) PreparePingArgs(receiver *ClusterNode, typ api.PingType) (args *api.PingArgs) {
 	cs.mu.RLock()
 
 	freshnodes := len(cs.Nodes) - 2
@@ -118,7 +140,7 @@ func (cs *ClusterState) PreparePingArgs(target *ClusterNode, typ api.PingType) (
 		maxIteration--
 		this := cs.GetRandomNode()
 
-		if this.NodeId == cs.Myself.NodeId || this.NodeId == target.NodeId {
+		if this.NodeId == cs.Myself.NodeId || this.NodeId == receiver.NodeId {
 			continue
 		}
 		if selected[this.NodeId] {
@@ -144,33 +166,21 @@ func (cs *ClusterState) PreparePingArgs(target *ClusterNode, typ api.PingType) (
 }
 
 // 处理 rpc
-func (cs *ClusterState) ProcessPing(args *api.PingArgs, reply *api.PingArgs) {
+func (cs *ClusterState) PingPong(args *api.PingArgs, reply *api.PingArgs) {
+
 	cs.mu.RLock()
-	sender, ok := cs.Nodes[args.NodeId]
+	sender := cs.Nodes[args.NodeId]
 	cs.mu.RUnlock()
+
 	if args.Type == api.PingType_Ping || args.Type == api.PintType_Meet {
 		reply = cs.PreparePingArgs(sender, api.PingType_Pong)
 	}
-	if !ok && args.Type == api.PintType_Meet {
-
-		cs.Nodes[args.NodeId] = &ClusterNode{
-			NodeId: args.NodeId,
-			Addr:   args.Addr,
-		}
-		cs.NodesIds = append(cs.NodesIds, args.NodeId)
-		go cs.ProcessGossipNodeInfo(args.KnownNodes)
-
-	}
-
-	if ok {
-		go cs.ClusterProcessConfigInfo(args, sender)
-		go cs.ProcessGossipNodeInfo(args.KnownNodes)
-	}
+	cs.ProcessPacket(args, sender)
 }
 
 func (cs *ClusterState) ClusterProcessConfigInfo(args *api.PingArgs, sender *ClusterNode) {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
 
 	dirtySlots := args.Slots != sender.Slots
 	if dirtySlots {

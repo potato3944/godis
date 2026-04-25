@@ -18,7 +18,7 @@ func NewGossipServer(cs *cluster.ClusterState) *GossipServer {
 }
 
 func (gs *GossipServer) PingPong(args *api.PingArgs, reply *api.PingArgs) error {
-	gs.cluster.ProcessPing(args, reply)
+	gs.cluster.PingPong(args, reply)
 	return nil
 }
 

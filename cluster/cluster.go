@@ -55,6 +55,25 @@ func (node *ClusterNode) AddFailureReport(reporter *ClusterNode) {
 	})
 }
 
+func (node *ClusterNode) NodeFailureReportsCount() int {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+	count := 0
+	now := time.Now()
+	for e := node.FailReports.Front(); e != nil; {
+		next := e.Next()
+		report := e.Value.(*ClusterNodeFailReport)
+		// 如果故障报告时间超过 2 倍 NodeTimeout，则认为已过期并清理
+		if now.Sub(report.Time).Milliseconds() > NodeTimeout*2 {
+			node.FailReports.Remove(e)
+		} else {
+			count++
+		}
+		e = next
+	}
+	return count
+}
+
 func (node *ClusterNode) DelFailureReport(reporter *ClusterNode) {
 	node.mu.Lock()
 	defer node.mu.Unlock()
@@ -501,21 +520,40 @@ func (cs *ClusterState) ClusterCron() {
 		// 计算距离上次收到 PONG 的时间（毫秒）
 		var delay int64
 		if !node.PongReceived.IsZero() {
-			delay = int64(time.Since(node.PongReceived))
+			delay = time.Since(node.PongReceived).Milliseconds()
 		} else {
 			// 如果从未收到过 PONG，且已经发出了 PING
 			if !node.PingSent.IsZero() {
-				delay = int64(time.Since(node.PongReceived))
+				delay = time.Since(node.PingSent).Milliseconds()
 			}
-			// 如果超时超过 NodeTimeout，标记为 PFAIL
-			if delay > NodeTimeout {
-				if (node.Flags & CLUSTER_NODE_PFAIL) == 0 {
-					log.Printf("Node %s is PFAIL (no PONG for %dms)", node.NodeId, delay)
-					node.Flags |= CLUSTER_NODE_PFAIL
+		}
+
+		// 如果超时超过 NodeTimeout，标记为 PFAIL
+		if delay > NodeTimeout {
+			if (node.Flags & CLUSTER_NODE_PFAIL) == 0 {
+				log.Printf("Node %s is PFAIL (no PONG for %dms)", node.NodeId, delay)
+				node.Flags |= CLUSTER_NODE_PFAIL
+			}
+		} else {
+			// 如果在超时时间内收到了，清除 PFAIL 和 FAIL
+			node.Flags &= ^(CLUSTER_NODE_PFAIL | CLUSTER_NODE_FAIL)
+		}
+
+		// 下线升级逻辑：如果当前节点被认为是 PFAIL，检查是否需要升级为 FAIL (客观下线)
+		if (node.Flags & CLUSTER_NODE_PFAIL) != 0 {
+			failures := node.NodeFailureReportsCount()
+			// 加上我们自己也认为它下线了
+			failures++
+			// 多数派法定人数（简单处理为总节点数的一半以上，Redis 会使用负责槽的主节点数）
+			neededQuorum := len(cs.Nodes)/2 + 1
+
+			if failures >= neededQuorum {
+				if (node.Flags & CLUSTER_NODE_FAIL) == 0 {
+					log.Printf("Node %s is FAIL (objective down, %d/%d reports)", node.NodeId, failures, neededQuorum)
+					node.Flags |= CLUSTER_NODE_FAIL
+					node.Flags &= ^CLUSTER_NODE_PFAIL
+					// todo 广播 FAIL 消息给整个集群，强制让其他节点也认为其下线
 				}
-			} else {
-				// 如果在超时时间内收到了，清除 PFAIL
-				node.Flags &= ^CLUSTER_NODE_PFAIL
 			}
 		}
 

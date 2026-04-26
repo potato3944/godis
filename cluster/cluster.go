@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"container/list"
 	"log"
 	"math/rand"
 	"net/rpc"
@@ -30,11 +31,48 @@ type ClusterNode struct {
 	SlaveOf      *ClusterNode
 	PingSent     time.Time
 	PongReceived time.Time
+	FailReports  list.List
+}
+
+type ClusterNodeFailReport struct {
+	Node *ClusterNode
+	Time time.Time
+}
+
+func (node *ClusterNode) AddFailureReport(reporter *ClusterNode) {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+	for e := node.FailReports.Front(); e != nil; e = e.Next() {
+		report := e.Value.(*ClusterNodeFailReport)
+		if report.Node == reporter {
+			report.Time = time.Now()
+			return
+		}
+	}
+	node.FailReports.PushBack(&ClusterNodeFailReport{
+		Node: reporter,
+		Time: time.Now(),
+	})
+}
+
+func (node *ClusterNode) DelFailureReport(reporter *ClusterNode) {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+	for e := node.FailReports.Front(); e != nil; e = e.Next() {
+		report := e.Value.(*ClusterNodeFailReport)
+		if report.Node == reporter {
+			node.FailReports.Remove(e)
+			return
+		}
+	}
 }
 
 const (
 	CLUSTER_NODE_MASTER = 1 << 0
 	CLUSTER_NODE_SLAVE  = 1 << 1
+	CLUSTER_NODE_PFAIL  = 1 << 2 // 疑似下线 (Possible Failure)
+	CLUSTER_NODE_FAIL   = 1 << 3 // 确认下线 (Confirmed Failure)
+	NodeTimeout         = 5000   // 节点超时阈值 (毫秒)
 )
 
 type ClusterState struct {
@@ -107,7 +145,7 @@ func (cs *ClusterState) ProcessPacket(args *api.PingArgs, sender *ClusterNode) {
 			PongReceived: time.Now(),
 		}
 		cs.NodesIds = append(cs.NodesIds, args.NodeId)
-		go cs.ProcessGossipNodeInfo(args.KnownNodes)
+		go cs.ProcessGossipNodeInfo(nil, args.KnownNodes)
 		return
 	}
 	if sender != nil && args.Type == api.PingType_Pong {
@@ -116,7 +154,7 @@ func (cs *ClusterState) ProcessPacket(args *api.PingArgs, sender *ClusterNode) {
 
 	if sender != nil {
 		go cs.ClusterProcessConfigInfo(args, sender)
-		go cs.ProcessGossipNodeInfo(args.KnownNodes)
+		go cs.ProcessGossipNodeInfo(sender, args.KnownNodes)
 	}
 }
 
@@ -143,6 +181,7 @@ func (cs *ClusterState) PreparePingArgs(receiver *ClusterNode, typ api.PingType)
 		gossipEntry := api.GossipNodeInfo{
 			NodeId: this.NodeId,
 			Addr:   this.Addr,
+			Flags:  this.Flags,
 		}
 		knownNodes = append(knownNodes, gossipEntry) // 塞进包里
 		selected[this.NodeId] = true
@@ -202,15 +241,24 @@ func (cs *ClusterState) ClusterUpdateSlotsConfigWith(slots BitMap, sender *Clust
 }
 
 // 处理 gossip 携带的其他节点的信息
-func (cs *ClusterState) ProcessGossipNodeInfo(nodes []api.GossipNodeInfo) {
+func (cs *ClusterState) ProcessGossipNodeInfo(sender *ClusterNode, nodes []api.GossipNodeInfo) {
 	cs.mu.Lock()
-	for _, node := range nodes {
-		if _, ok := cs.Nodes[node.NodeId]; !ok {
-			cs.Nodes[node.NodeId] = &ClusterNode{
-				NodeId: node.NodeId,
-				Addr:   node.Addr,
+	for _, nodeInfo := range nodes {
+		node, ok := cs.Nodes[nodeInfo.NodeId]
+		if !ok {
+			cs.Nodes[nodeInfo.NodeId] = &ClusterNode{
+				NodeId: nodeInfo.NodeId,
+				Addr:   nodeInfo.Addr,
 			}
-			cs.NodesIds = append(cs.NodesIds, node.NodeId)
+			cs.NodesIds = append(cs.NodesIds, nodeInfo.NodeId)
+		} else if sender != nil && nodeInfo.NodeId != cs.Myself.NodeId {
+			// 如果发送者认为该节点 PFAIL 或 FAIL
+			if (nodeInfo.Flags & (CLUSTER_NODE_PFAIL | CLUSTER_NODE_FAIL)) != 0 {
+				node.AddFailureReport(sender)
+			} else {
+				// 节点状态正常，清除对应的故障报告
+				node.DelFailureReport(sender)
+			}
 		}
 	}
 	cs.mu.Unlock()
@@ -339,7 +387,6 @@ func (cs *ClusterState) ClusterMigrateKeys(args *api.MigrateKeysArgs, reply *api
 	}
 }
 
-
 func (cs *ClusterState) ClusterRestore(args *api.RestoreArgs, reply *api.RestoreReply) {
 	cs.ConcurrentMap.Set(args.Key, args.Value)
 	reply.Success = true
@@ -445,29 +492,55 @@ func (cs *ClusterState) ClusterCron() {
 	var minPong time.Time
 	var minPongNode *ClusterNode
 	defer ticker.Stop()
-
-	for range ticker.C {
-		iteration++
-		if iteration%10 == 0 {
-			for range 5 {
-				node := cs.GetRandomNode()
-				node.mu.Lock()
-				if node.PingSent.IsZero() || node == cs.Myself {
-					cs.mu.Unlock()
-					continue
+	cs.mu.Lock()
+	// --- 1. 遍历所有节点进行超时检查 ---
+	for _, node := range cs.Nodes {
+		if node == cs.Myself {
+			continue
+		}
+		// 计算距离上次收到 PONG 的时间（毫秒）
+		var delay int64
+		if !node.PongReceived.IsZero() {
+			delay = int64(time.Since(node.PongReceived))
+		} else {
+			// 如果从未收到过 PONG，且已经发出了 PING
+			if !node.PingSent.IsZero() {
+				delay = int64(time.Since(node.PongReceived))
+			}
+			// 如果超时超过 NodeTimeout，标记为 PFAIL
+			if delay > NodeTimeout {
+				if (node.Flags & CLUSTER_NODE_PFAIL) == 0 {
+					log.Printf("Node %s is PFAIL (no PONG for %dms)", node.NodeId, delay)
+					node.Flags |= CLUSTER_NODE_PFAIL
 				}
-				if minPongNode == nil || node.PongReceived.Before(minPong) {
-					minPongNode = node
-					minPong = node.PongReceived
-				}
-				cs.mu.Unlock()
+			} else {
+				// 如果在超时时间内收到了，清除 PFAIL
+				node.Flags &= ^CLUSTER_NODE_PFAIL
 			}
 		}
-		if minPongNode != nil {
-			cs.ClusterSendPing(minPongNode, api.PingType_Ping)
-		}
-	}
 
+		for range ticker.C {
+			iteration++
+			if iteration%10 == 0 {
+				for range 5 {
+					node := cs.GetRandomNode()
+
+					if node.PingSent.IsZero() || node == cs.Myself {
+
+						continue
+					}
+					if minPongNode == nil || node.PongReceived.Before(minPong) {
+						minPongNode = node
+						minPong = node.PongReceived
+					}
+				}
+			}
+			if minPongNode != nil {
+				go cs.ClusterSendPing(minPongNode, api.PingType_Ping)
+			}
+		}
+		cs.mu.Unlock()
+	}
 }
 
 //todo 全量同步

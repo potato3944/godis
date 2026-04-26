@@ -45,6 +45,7 @@ type DeleteReply struct {
 type GossipNodeInfo struct {
 	NodeId string
 	Addr   string
+	Flags  int
 }
 
 type PingType int

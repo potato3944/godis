@@ -62,6 +62,9 @@ type PingArgs struct {
 	ConfigEpoch  uint64
 	CurrentEpoch uint64
 	Type         PingType
+	Flags        uint16
+	SlaveOf      string
+	Offset       uint64
 	KnownNodes   []GossipNodeInfo // 这就是 hdr->data.ping.gossip
 }
 
@@ -95,5 +98,18 @@ type RestoreArgs struct {
 }
 
 type RestoreReply struct {
+	Success bool
+}
+
+// api/types.go
+
+type PropagateArgs struct {
+	Op    string      // 操作类型: "SET", "DEL"
+	Key   string
+	Value interface{} // 只有 SET 需要
+	Offset int64      // 这次操作在 Master 上的偏移量
+}
+
+type PropagateReply struct {
 	Success bool
 }

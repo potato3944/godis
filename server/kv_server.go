@@ -59,6 +59,10 @@ func (kv *KVServer) Set(args *api.SetArgs, reply *api.SetReply) error {
 
 	kv.store.Set(args.Key, args.Value)
 	reply.Success = true
+
+	// 2. 如果我有从节点，发起异步传播
+	go kv.cluster.PropagateToSlaves("SET", args.Key, args.Value)
+
 	return nil
 }
 
@@ -70,6 +74,8 @@ func (kv *KVServer) Delete(args *api.DeleteArgs, reply *api.DeleteReply) error {
 
 	kv.store.Delete(args.Key)
 	reply.Success = true
+	go kv.cluster.PropagateToSlaves("DEL", args.Key, nil)
+
 	return nil
 }
 
@@ -77,3 +83,26 @@ func (kv *KVServer) Delete(args *api.DeleteArgs, reply *api.DeleteReply) error {
 func (kv *KVServer) Register() error {
 	return rpc.Register(kv)
 }
+
+// server/kv_server.go
+
+// Propagate 是由 Master 调用的 RPC 方法
+func (kv *KVServer) Propagate(args *api.PropagateArgs, reply *api.PropagateReply) error {
+	// 1. 安全校验：实际应用中应该校验调用者是否真的是自己的 Master
+	
+	// 2. 执行操作
+	switch args.Op {
+	case "SET":
+		kv.store.Set(args.Key, args.Value)
+	case "DEL":
+		kv.store.Delete(args.Key)
+	}
+
+	// 3. 更新本地的复制偏移量（可选，用于断线重连后的增量同步）
+	// kv.cluster.UpdateReplOffset(args.Offset)
+
+	reply.Success = true
+	return nil
+}
+
+

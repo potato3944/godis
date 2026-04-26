@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"net/rpc"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"predis/api"
@@ -17,16 +18,27 @@ const NumSlots = 16384
 type BitMap [2048]byte
 
 type ClusterNode struct {
-	mu          sync.RWMutex
-	NodeId      string
-	Addr        string
-	Slots       BitMap
-	RpcClient   *rpc.Client
-	ConfigEpoch uint64
+	mu           sync.Mutex
+	NodeId       string
+	Addr         string
+	Slots        BitMap
+	RpcClient    *rpc.Client
+	ConfigEpoch  uint64
+	Flags        int
+	NumSlaves    int
+	Slaves       []*ClusterNode
+	SlaveOf      *ClusterNode
+	PingSent     time.Time
+	PongReceived time.Time
 }
 
+const (
+	CLUSTER_NODE_MASTER = 1 << 0
+	CLUSTER_NODE_SLAVE  = 1 << 1
+)
+
 type ClusterState struct {
-	mu                sync.RWMutex
+	mu                sync.Mutex
 	Myself            *ClusterNode
 	Nodes             map[string]*ClusterNode //NodeId -> *ClusterNode
 	NodesIds          []string
@@ -37,12 +49,13 @@ type ClusterState struct {
 	CurrentEpoch  uint64
 	ConcurrentMap store.Store
 	TodoFlags     uint64
+	ReplOffset    int64
 }
 
 const (
-	CLUSTER_TODO_NONE           uint64 = 0
-	CLUSTER_TODO_SAVE_CONFIG    uint64 = 1 << 0
-	CLUSTER_TODO_BROADCAST_PONG uint64 = 1 << 1
+	CLUSTER_TODO_NONE           uint64 = 1
+	CLUSTER_TODO_SAVE_CONFIG    uint64 = 1 << 1
+	CLUSTER_TODO_BROADCAST_PONG uint64 = 1 << 2
 )
 
 // NewClusterState 创建动态 Gossip 集群的本地视界
@@ -60,37 +73,13 @@ func NewClusterState(nodeId, addr string) *ClusterState {
 	return cs
 }
 
-// IsMine 计算目标 Key 属于谁。如果无人管理默认返回自己管（降级）。
-func (cs *ClusterState) IsMine(key string) (bool, string) {
-	slot := utils.KeyHashSlot(key)
-
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-
-	for _, node := range cs.Nodes {
-		if node.Slots.Get(slot) {
-			return node.NodeId == cs.Myself.NodeId, node.Addr
-		}
-	}
-	return true, ""
-}
-
 // 发起 rpc
 func (cs *ClusterState) ClusterSendPing(receiver *ClusterNode, typ api.PingType) {
 	args := cs.PreparePingArgs(receiver, typ)
-	receiver.mu.Lock()
-	client := receiver.RpcClient
+	client := receiver.GetOrCreateClient()
 	if client == nil {
-		newClient, err := rpc.Dial("tcp", receiver.Addr)
-		if err != nil {
-			log.Printf("Dial target %s failed: %v\n", receiver.Addr, err)
-			receiver.mu.Unlock()
-			return
-		}
-		receiver.RpcClient = newClient
-		client = newClient
+		return
 	}
-	receiver.mu.Unlock()
 	// 发起异步 RPC 调用
 	reply := &api.PingArgs{}
 	err := client.Call("GossipServer.Ping", args, reply)
@@ -98,9 +87,9 @@ func (cs *ClusterState) ClusterSendPing(receiver *ClusterNode, typ api.PingType)
 		log.Println(err)
 		return
 	}
-	cs.mu.RLock()
+	cs.mu.Lock()
 	sender := cs.Nodes[args.NodeId]
-	cs.mu.RUnlock()
+	cs.mu.Unlock()
 
 	cs.ProcessPacket(args, sender)
 
@@ -108,16 +97,21 @@ func (cs *ClusterState) ClusterSendPing(receiver *ClusterNode, typ api.PingType)
 
 func (cs *ClusterState) ProcessPacket(args *api.PingArgs, sender *ClusterNode) {
 
+	cs.mu.Lock()
+	sender.PingSent = time.Time{}
+	defer cs.mu.Unlock()
 	if sender == nil && args.Type == api.PintType_Meet {
-
 		cs.Nodes[args.NodeId] = &ClusterNode{
-			NodeId: args.NodeId,
-			Addr:   args.Addr,
+			NodeId:       args.NodeId,
+			Addr:         args.Addr,
+			PongReceived: time.Now(),
 		}
 		cs.NodesIds = append(cs.NodesIds, args.NodeId)
 		go cs.ProcessGossipNodeInfo(args.KnownNodes)
 		return
-
+	}
+	if sender != nil && args.Type == api.PingType_Pong {
+		sender.PongReceived = time.Now()
 	}
 
 	if sender != nil {
@@ -127,7 +121,7 @@ func (cs *ClusterState) ProcessPacket(args *api.PingArgs, sender *ClusterNode) {
 }
 
 func (cs *ClusterState) PreparePingArgs(receiver *ClusterNode, typ api.PingType) (args *api.PingArgs) {
-	cs.mu.RLock()
+	cs.mu.Lock()
 
 	freshnodes := len(cs.Nodes) - 2
 	wanted := min(max(len(cs.Nodes)/10, 3), freshnodes)
@@ -161,16 +155,17 @@ func (cs *ClusterState) PreparePingArgs(receiver *ClusterNode, typ api.PingType)
 		Type:       typ,
 		KnownNodes: knownNodes,
 	}
-	cs.mu.RUnlock()
+	receiver.PingSent = time.Now()
+	cs.mu.Unlock()
 	return
 }
 
 // 处理 rpc
 func (cs *ClusterState) PingPong(args *api.PingArgs, reply *api.PingArgs) {
 
-	cs.mu.RLock()
+	cs.mu.Lock()
 	sender := cs.Nodes[args.NodeId]
-	cs.mu.RUnlock()
+	cs.mu.Unlock()
 
 	if args.Type == api.PingType_Ping || args.Type == api.PintType_Meet {
 		reply = cs.PreparePingArgs(sender, api.PingType_Pong)
@@ -318,13 +313,13 @@ func (cs *ClusterState) ClusterBumpConfigEpochWithoutConsensus() bool {
 }
 
 func (cs *ClusterState) ClusterGetMaxEpoch() uint64 {
-	cs.mu.RLock()
+	cs.mu.Lock()
 	var maxEpoch uint64 = 0
 	for _, node := range cs.Nodes {
 		maxEpoch = max(maxEpoch, node.ConfigEpoch)
 	}
 	maxEpoch = max(maxEpoch, cs.CurrentEpoch)
-	cs.mu.RUnlock()
+	cs.mu.Unlock()
 	return maxEpoch
 }
 
@@ -344,15 +339,6 @@ func (cs *ClusterState) ClusterMigrateKeys(args *api.MigrateKeysArgs, reply *api
 	}
 }
 
-func (cs *ClusterState) StartHeart() {
-	ticker := time.NewTicker(1 * time.Second)
-	for range ticker.C {
-		if cs.TodoFlags&CLUSTER_TODO_BROADCAST_PONG > 0 {
-			//发送 ping
-			cs.clusterBroadcastPong()
-		}
-	}
-}
 
 func (cs *ClusterState) ClusterRestore(args *api.RestoreArgs, reply *api.RestoreReply) {
 	cs.ConcurrentMap.Set(args.Key, args.Value)
@@ -366,8 +352,8 @@ func (cs *ClusterState) ClusterTodo(flags uint64) {
 }
 
 func (cs *ClusterState) clusterBroadcastPong() {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
 	for _, node := range cs.Nodes {
 		if node.NodeId == cs.Myself.NodeId {
 			continue
@@ -391,3 +377,97 @@ func (bm *BitMap) Clear(index uint) {
 func (bm *BitMap) Get(index uint) bool {
 	return (bm[index/8] & (1 << (index % 8))) != 0
 }
+
+// cluster/cluster.go
+
+func (cs *ClusterState) PropagateToSlaves(op string, key string, value interface{}) {
+	cs.mu.Lock()
+	slaves := cs.Myself.Slaves
+	// 增加偏移量
+	atomic.AddInt64(&cs.ReplOffset, 1)
+	currentOffset := cs.ReplOffset
+	cs.mu.Unlock()
+
+	for _, slave := range slaves {
+		go func(node *ClusterNode) {
+			args := &api.PropagateArgs{
+				Op:     op,
+				Key:    key,
+				Value:  value,
+				Offset: currentOffset,
+			}
+			reply := &api.PropagateReply{}
+
+			// 复用之前的 RPC 发送逻辑
+			client := node.GetOrCreateClient() // 你可以封装一个获取 RPC Client 的辅助函数
+			if client != nil {
+				client.Call("KVServer.Propagate", args, reply)
+			}
+		}(slave)
+	}
+}
+
+func (node *ClusterNode) GetOrCreateClient() *rpc.Client {
+	node.mu.Lock()
+	client := node.RpcClient
+	if client == nil {
+		newClient, err := rpc.Dial("tcp", node.Addr)
+		if err != nil {
+			log.Printf("Dial target %s failed: %v\n", node.Addr, err)
+			node.mu.Unlock()
+			return nil
+		}
+		node.RpcClient = newClient
+		client = newClient
+	}
+	node.mu.Unlock()
+	return client
+}
+
+// IsMine 计算目标 Key 属于谁。如果无人管理默认返回自己管（降级）。
+func (cs *ClusterState) IsMine(key string) (bool, string) {
+	slot := utils.KeyHashSlot(key)
+
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	for _, node := range cs.Nodes {
+		if node.Slots.Get(slot) {
+			return node.NodeId == cs.Myself.NodeId, node.Addr
+		}
+	}
+	return true, ""
+}
+
+func (cs *ClusterState) ClusterCron() {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	var iteration uint64 = 0
+	var minPong time.Time
+	var minPongNode *ClusterNode
+	defer ticker.Stop()
+
+	for range ticker.C {
+		iteration++
+		if iteration%10 == 0 {
+			for range 5 {
+				node := cs.GetRandomNode()
+				node.mu.Lock()
+				if node.PingSent.IsZero() || node == cs.Myself {
+					cs.mu.Unlock()
+					continue
+				}
+				if minPongNode == nil || node.PongReceived.Before(minPong) {
+					minPongNode = node
+					minPong = node.PongReceived
+				}
+				cs.mu.Unlock()
+			}
+		}
+		if minPongNode != nil {
+			cs.ClusterSendPing(minPongNode, api.PingType_Ping)
+		}
+	}
+
+}
+
+//todo 全量同步

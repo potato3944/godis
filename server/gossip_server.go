@@ -22,6 +22,11 @@ func (gs *GossipServer) PingPong(args *api.PingArgs, reply *api.PingArgs) error 
 	return nil
 }
 
+func (gs *GossipServer) RequestVote(args *api.RequestVoteArgs, reply *api.RequestVoteReply) error {
+	gs.cluster.HandleRequestVote(args, reply)
+	return nil
+}
+
 // Register 仅仅注册自身到默认 RPC 复用器中
 func (gs *GossipServer) Register() error {
 	return rpc.Register(gs)

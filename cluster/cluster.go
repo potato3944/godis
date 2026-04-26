@@ -107,6 +107,11 @@ type ClusterState struct {
 	ConcurrentMap store.Store
 	TodoFlags     uint64
 	ReplOffset    int64
+
+	FailoverAuthTime  time.Time
+	FailoverAuthCount int
+	FailoverAuthSent  bool
+	LastVoteEpoch     uint64
 }
 
 const (
@@ -508,77 +513,230 @@ func (cs *ClusterState) IsMine(key string) (bool, string) {
 func (cs *ClusterState) ClusterCron() {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	var iteration uint64 = 0
-	var minPong time.Time
-	var minPongNode *ClusterNode
 	defer ticker.Stop()
-	cs.mu.Lock()
-	// --- 1. 遍历所有节点进行超时检查 ---
-	for _, node := range cs.Nodes {
-		if node == cs.Myself {
-			continue
-		}
-		// 计算距离上次收到 PONG 的时间（毫秒）
-		var delay int64
-		if !node.PongReceived.IsZero() {
-			delay = time.Since(node.PongReceived).Milliseconds()
-		} else {
-			// 如果从未收到过 PONG，且已经发出了 PING
-			if !node.PingSent.IsZero() {
-				delay = time.Since(node.PingSent).Milliseconds()
+
+	for range ticker.C {
+		iteration++
+		var minPong time.Time
+		var minPongNode *ClusterNode
+
+		cs.mu.Lock()
+		// --- 1. 遍历所有节点进行超时检查 ---
+		for _, node := range cs.Nodes {
+			if node == cs.Myself {
+				continue
 			}
-		}
-
-		// 如果超时超过 NodeTimeout，标记为 PFAIL
-		if delay > NodeTimeout {
-			if (node.Flags & CLUSTER_NODE_PFAIL) == 0 {
-				log.Printf("Node %s is PFAIL (no PONG for %dms)", node.NodeId, delay)
-				node.Flags |= CLUSTER_NODE_PFAIL
-			}
-		} else {
-			// 如果在超时时间内收到了，清除 PFAIL 和 FAIL
-			node.Flags &= ^(CLUSTER_NODE_PFAIL | CLUSTER_NODE_FAIL)
-		}
-
-		// 下线升级逻辑：如果当前节点被认为是 PFAIL，检查是否需要升级为 FAIL (客观下线)
-		if (node.Flags & CLUSTER_NODE_PFAIL) != 0 {
-			failures := node.NodeFailureReportsCount()
-			// 加上我们自己也认为它下线了
-			failures++
-			// 多数派法定人数（简单处理为总节点数的一半以上，Redis 会使用负责槽的主节点数）
-			neededQuorum := len(cs.Nodes)/2 + 1
-
-			if failures >= neededQuorum {
-				if (node.Flags & CLUSTER_NODE_FAIL) == 0 {
-					log.Printf("Node %s is FAIL (objective down, %d/%d reports)", node.NodeId, failures, neededQuorum)
-					node.Flags |= CLUSTER_NODE_FAIL
-					node.Flags &= ^CLUSTER_NODE_PFAIL
-					// todo 广播 FAIL 消息给整个集群，强制让其他节点也认为其下线
+			// 计算距离上次收到 PONG 的时间（毫秒）
+			var delay int64
+			if !node.PongReceived.IsZero() {
+				delay = time.Since(node.PongReceived).Milliseconds()
+			} else {
+				// 如果从未收到过 PONG，且已经发出了 PING
+				if !node.PingSent.IsZero() {
+					delay = time.Since(node.PingSent).Milliseconds()
 				}
 			}
-		}
 
-		for range ticker.C {
-			iteration++
-			if iteration%10 == 0 {
-				for range 5 {
-					node := cs.GetRandomNode()
+			// 如果超时超过 NodeTimeout，标记为 PFAIL
+			if delay > NodeTimeout {
+				if (node.Flags & CLUSTER_NODE_PFAIL) == 0 {
+					log.Printf("Node %s is PFAIL (no PONG for %dms)", node.NodeId, delay)
+					node.Flags |= CLUSTER_NODE_PFAIL
+				}
+			} else {
+				// 如果在超时时间内收到了，清除 PFAIL 和 FAIL
+				node.Flags &= ^(CLUSTER_NODE_PFAIL | CLUSTER_NODE_FAIL)
+			}
 
-					if node.PingSent.IsZero() || node == cs.Myself {
+			// 下线升级逻辑：如果当前节点被认为是 PFAIL，检查是否需要升级为 FAIL (客观下线)
+			if (node.Flags & CLUSTER_NODE_PFAIL) != 0 {
+				failures := node.NodeFailureReportsCount()
+				// 加上我们自己也认为它下线了
+				failures++
+				// 多数派法定人数（简单处理为总节点数的一半以上，Redis 会使用负责槽的主节点数）
+				neededQuorum := cs.GetMasterCount()/2 + 1
 
-						continue
-					}
-					if minPongNode == nil || node.PongReceived.Before(minPong) {
-						minPongNode = node
-						minPong = node.PongReceived
+				if failures >= neededQuorum {
+					if (node.Flags & CLUSTER_NODE_FAIL) == 0 {
+						log.Printf("Node %s is FAIL (objective down, %d/%d reports)", node.NodeId, failures, neededQuorum)
+						node.Flags |= CLUSTER_NODE_FAIL
+						node.Flags &= ^CLUSTER_NODE_PFAIL
+						// todo 广播 FAIL 消息给整个集群，强制让其他节点也认为其下线
 					}
 				}
 			}
-			if minPongNode != nil {
-				go cs.ClusterSendPing(minPongNode, api.PingType_Ping)
+		}
+
+		// --- 2. 检查自己是否是 Slave 且 Master 客观下线 ---
+		if (cs.Myself.Flags&CLUSTER_NODE_SLAVE) != 0 && cs.Myself.SlaveOf != nil {
+			if (cs.Myself.SlaveOf.Flags & CLUSTER_NODE_FAIL) != 0 {
+				go cs.HandleFailover()
 			}
+		}
+
+		// --- 3. 随机选择节点发送 PING (Gossip) ---
+		if iteration%10 == 0 {
+			for range 5 {
+				node := cs.GetRandomNode()
+
+				if node.PingSent.IsZero() || node == cs.Myself {
+					continue
+				}
+				if minPongNode == nil || node.PongReceived.Before(minPong) {
+					minPongNode = node
+					minPong = node.PongReceived
+				}
+			}
+		}
+		if minPongNode != nil {
+			go cs.ClusterSendPing(minPongNode, api.PingType_Ping)
 		}
 		cs.mu.Unlock()
 	}
+}
+
+func (cs *ClusterState) GetMasterCount() int {
+	count := 0
+	for _, node := range cs.Nodes {
+		if (node.Flags & CLUSTER_NODE_MASTER) != 0 {
+			count++
+		}
+	}
+	// 如果没有节点被标记为 MASTER，则为了测试简化，使用总节点数
+	if count == 0 {
+		return len(cs.Nodes)
+	}
+	return count
+}
+
+func (cs *ClusterState) HandleFailover() {
+	cs.mu.Lock()
+
+	// 延迟一定时间，避免多个 Slave 同时发起选举造成脑裂
+	if cs.FailoverAuthTime.IsZero() {
+		delay := time.Duration(500+rand.Intn(1000)) * time.Millisecond
+		cs.FailoverAuthTime = time.Now().Add(delay)
+		cs.mu.Unlock()
+		return
+	}
+
+	if time.Now().Before(cs.FailoverAuthTime) {
+		cs.mu.Unlock()
+		return
+	}
+
+	// 如果还没有发送拉票请求，则发起一轮新的选举
+	if !cs.FailoverAuthSent {
+		cs.CurrentEpoch++
+		cs.FailoverAuthSent = true
+		cs.FailoverAuthCount = 0
+
+		log.Printf("Starting failover election for epoch %d", cs.CurrentEpoch)
+		
+		// 复制出所有 Master 节点
+		var masters []*ClusterNode
+		for _, node := range cs.Nodes {
+			if node.NodeId != cs.Myself.NodeId && (node.Flags&CLUSTER_NODE_MASTER) != 0 {
+				masters = append(masters, node)
+			}
+		}
+		
+		currentEpoch := cs.CurrentEpoch
+		configEpoch := cs.Myself.ConfigEpoch
+		cs.mu.Unlock()
+
+		// 广播 RequestVote
+		for _, node := range masters {
+			go cs.SendRequestVote(node, currentEpoch, configEpoch)
+		}
+	} else {
+		cs.mu.Unlock()
+	}
+}
+
+func (cs *ClusterState) SendRequestVote(node *ClusterNode, currentEpoch uint64, configEpoch uint64) {
+	client := node.GetOrCreateClient()
+	if client == nil {
+		return
+	}
+	args := &api.RequestVoteArgs{
+		NodeId:       cs.Myself.NodeId,
+		CurrentEpoch: currentEpoch,
+		ConfigEpoch:  configEpoch,
+		SlaveOf:      cs.Myself.SlaveOf.NodeId,
+	}
+	reply := &api.RequestVoteReply{}
+	err := client.Call("GossipServer.RequestVote", args, reply)
+	if err == nil && reply.VoteGranted {
+		cs.mu.Lock()
+		defer cs.mu.Unlock()
+		if cs.CurrentEpoch == currentEpoch && cs.FailoverAuthSent {
+			cs.FailoverAuthCount++
+			neededQuorum := cs.GetMasterCount()/2 + 1
+			if cs.FailoverAuthCount >= neededQuorum {
+				cs.PromoteToMaster()
+			}
+		}
+	}
+}
+
+func (cs *ClusterState) PromoteToMaster() {
+	log.Printf("Won election! Promoting to master.")
+	cs.Myself.Flags &= ^CLUSTER_NODE_SLAVE
+	cs.Myself.Flags |= CLUSTER_NODE_MASTER
+	cs.Myself.ConfigEpoch = cs.CurrentEpoch
+
+	oldMaster := cs.Myself.SlaveOf
+	cs.Myself.SlaveOf = nil
+
+	// 接管旧 Master 的全部 Slot
+	if oldMaster != nil {
+		for i := 0; i < NumSlots; i++ {
+			if cs.Slots[i] == oldMaster {
+				cs.Slots[i] = cs.Myself
+				cs.Myself.Slots.Set(uint(i))
+				oldMaster.Slots.Clear(uint(i))
+			}
+		}
+	}
+
+	cs.FailoverAuthSent = false
+	cs.FailoverAuthTime = time.Time{}
+
+	// 广播 PONG 以宣示主权
+	cs.ClusterTodo(CLUSTER_TODO_BROADCAST_PONG)
+}
+
+func (cs *ClusterState) HandleRequestVote(args *api.RequestVoteArgs, reply *api.RequestVoteReply) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	reply.VoteGranted = false
+
+	// 只有 Master 节点才有投票权
+	if (cs.Myself.Flags & CLUSTER_NODE_MASTER) == 0 {
+		return
+	}
+
+	// 如果请求方的纪元太旧，拒绝投票
+	if args.CurrentEpoch < cs.CurrentEpoch {
+		return
+	}
+	
+	// 更新本地的纪元
+	if args.CurrentEpoch > cs.CurrentEpoch {
+		cs.CurrentEpoch = args.CurrentEpoch
+	}
+
+	// 检查在这个纪元是否已经投过票了
+	if cs.LastVoteEpoch == args.CurrentEpoch {
+		return
+	}
+
+	// 投票
+	cs.LastVoteEpoch = args.CurrentEpoch
+	reply.VoteGranted = true
+	log.Printf("Voted for node %s in epoch %d", args.NodeId, args.CurrentEpoch)
 }
 
 //todo 全量同步

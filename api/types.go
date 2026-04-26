@@ -114,3 +114,14 @@ type PropagateArgs struct {
 type PropagateReply struct {
 	Success bool
 }
+
+type RequestVoteArgs struct {
+	NodeId       string
+	CurrentEpoch uint64
+	ConfigEpoch  uint64
+	SlaveOf      string
+}
+
+type RequestVoteReply struct {
+	VoteGranted bool
+}

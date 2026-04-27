@@ -9,9 +9,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"predis/api"
-	"predis/store"
-	"predis/utils"
+	"godis/api"
+	"godis/store"
+	"godis/utils"
 )
 
 const NumSlots = 16384
@@ -112,6 +112,20 @@ type ClusterState struct {
 	FailoverAuthCount int
 	FailoverAuthSent  bool
 	LastVoteEpoch     uint64
+	EventQueue  chan Event
+}
+
+type Event any
+
+func (cs *ClusterState) Loop(){
+	for event :=range cs.EventQueue{
+		switch e:=event.(type){
+		case *ClusterSendPing:
+			cs.ClusterSendPing(e.receiver,e.typ)
+		case *ClusterProcessPacket:
+			cs.ClusterProcessPacket(e.Args, e.Sender)
+		}
+	}
 }
 
 const (
@@ -135,93 +149,7 @@ func NewClusterState(nodeId, addr string) *ClusterState {
 	return cs
 }
 
-// 发起 rpc
-func (cs *ClusterState) ClusterSendPing(receiver *ClusterNode, typ api.PingType) {
-	args := cs.PreparePingArgs(receiver, typ)
-	client := receiver.GetOrCreateClient()
-	if client == nil {
-		return
-	}
-	// 发起异步 RPC 调用
-	reply := &api.PingArgs{}
-	err := client.Call("GossipServer.Ping", args, reply)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-	cs.mu.Lock()
-	sender := cs.Nodes[args.NodeId]
-	cs.mu.Unlock()
 
-	cs.ProcessPacket(args, sender)
-
-}
-
-func (cs *ClusterState) ProcessPacket(args *api.PingArgs, sender *ClusterNode) {
-
-	cs.mu.Lock()
-	sender.PingSent = time.Time{}
-	defer cs.mu.Unlock()
-	if sender == nil && args.Type == api.PintType_Meet {
-		cs.Nodes[args.NodeId] = &ClusterNode{
-			NodeId:       args.NodeId,
-			Addr:         args.Addr,
-			PongReceived: time.Now(),
-		}
-		cs.NodesIds = append(cs.NodesIds, args.NodeId)
-		go cs.ProcessGossipNodeInfo(nil, args.KnownNodes)
-		return
-	}
-	if sender != nil && args.Type == api.PingType_Pong {
-		sender.PongReceived = time.Now()
-	}
-
-	if sender != nil {
-		go cs.ClusterProcessConfigInfo(args, sender)
-		go cs.ProcessGossipNodeInfo(sender, args.KnownNodes)
-	}
-}
-
-func (cs *ClusterState) PreparePingArgs(receiver *ClusterNode, typ api.PingType) (args *api.PingArgs) {
-	cs.mu.Lock()
-
-	freshnodes := len(cs.Nodes) - 2
-	wanted := min(max(len(cs.Nodes)/10, 3), freshnodes)
-
-	maxIteration := wanted * 3
-	gossipCount := 0
-	selected := make(map[string]bool)
-	knownNodes := make([]api.GossipNodeInfo, 0, wanted)
-	for freshnodes > 0 && gossipCount < wanted && maxIteration > 0 {
-		maxIteration--
-		this := cs.GetRandomNode()
-
-		if this.NodeId == cs.Myself.NodeId || this.NodeId == receiver.NodeId {
-			continue
-		}
-		if selected[this.NodeId] {
-			continue
-		}
-		gossipEntry := api.GossipNodeInfo{
-			NodeId: this.NodeId,
-			Addr:   this.Addr,
-			Flags:  this.Flags,
-		}
-		knownNodes = append(knownNodes, gossipEntry) // 塞进包里
-		selected[this.NodeId] = true
-		freshnodes--
-		gossipCount++
-	}
-	args = &api.PingArgs{
-		NodeId:     cs.Myself.NodeId,
-		Slots:      [2048]byte(cs.Myself.Slots),
-		Type:       typ,
-		KnownNodes: knownNodes,
-	}
-	receiver.PingSent = time.Now()
-	cs.mu.Unlock()
-	return
-}
 
 // 处理 rpc
 func (cs *ClusterState) PingPong(args *api.PingArgs, reply *api.PingArgs) {
@@ -233,7 +161,7 @@ func (cs *ClusterState) PingPong(args *api.PingArgs, reply *api.PingArgs) {
 	if args.Type == api.PingType_Ping || args.Type == api.PintType_Meet {
 		reply = cs.PreparePingArgs(sender, api.PingType_Pong)
 	}
-	cs.ProcessPacket(args, sender)
+	cs.ClusterProcessPacket(args, sender)
 }
 
 func (cs *ClusterState) ClusterProcessConfigInfo(args *api.PingArgs, sender *ClusterNode) {
@@ -478,22 +406,6 @@ func (cs *ClusterState) PropagateToSlaves(op string, key string, value interface
 	}
 }
 
-func (node *ClusterNode) GetOrCreateClient() *rpc.Client {
-	node.mu.Lock()
-	client := node.RpcClient
-	if client == nil {
-		newClient, err := rpc.Dial("tcp", node.Addr)
-		if err != nil {
-			log.Printf("Dial target %s failed: %v\n", node.Addr, err)
-			node.mu.Unlock()
-			return nil
-		}
-		node.RpcClient = newClient
-		client = newClient
-	}
-	node.mu.Unlock()
-	return client
-}
 
 // IsMine 计算目标 Key 属于谁。如果无人管理默认返回自己管（降级）。
 func (cs *ClusterState) IsMine(key string) (bool, string) {
@@ -740,3 +652,17 @@ func (cs *ClusterState) HandleRequestVote(args *api.RequestVoteArgs, reply *api.
 }
 
 //todo 全量同步
+
+func (cs *ClusterState) ClaimAllSlots() {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	for i := 0; i < NumSlots; i++ {
+		cs.Slots[i] = cs.Myself
+		cs.Myself.Slots.Set(uint(i))
+	}
+	cs.Myself.Flags |= CLUSTER_NODE_MASTER
+}
+
+func (cs *ClusterState) StartHeart() {
+	go cs.ClusterCron()
+}

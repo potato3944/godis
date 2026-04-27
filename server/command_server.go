@@ -1,8 +1,8 @@
 package server
 
 import (
-	"predis/api"
-	"predis/cluster"
+	"godis/api"
+	"godis/cluster"
 )
 
 type CommandServer struct {

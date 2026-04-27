@@ -1,8 +1,9 @@
 package store
 
 import (
-	"predis/utils"
+	"godis/utils"
 	"sync"
+	"time"
 )
 
 // Store 定义了基础 KV 存储引擎的接口
@@ -12,6 +13,8 @@ type Store interface {
 	Delete(key string)
 	Len() int
 	CountKeysInSlot(slot uint) int
+	SetExpire(key string, ttl time.Duration) bool
+	TTL(key string) time.Duration
 }
 
 
@@ -78,6 +81,18 @@ func (m *ConcurrentMap) Set(key string, value interface{}) {
 func (m *ConcurrentMap) Delete(key string) {
 	sm := m.GetSharedMap(key)
 	sm.Delete(key)
+}
+
+// SetExpire 为键设置过期时间
+func (m *ConcurrentMap) SetExpire(key string, ttl time.Duration) bool {
+	sm := m.GetSharedMap(key)
+	return sm.SetExpire(key, ttl)
+}
+
+// TTL 获取键的剩余过期时间
+func (m *ConcurrentMap) TTL(key string) time.Duration {
+	sm := m.GetSharedMap(key)
+	return sm.TTL(key)
 }
 
 // Len 获取当前存储的元素数量

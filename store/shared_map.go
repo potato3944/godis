@@ -8,12 +8,13 @@ import (
 
 // Entry 存储 KV 及其元数据
 type Entry struct {
-	Key       string
-	Value     any
-	Accessed  time.Time     // 最后访问时间 (LRU)
-	Created   time.Time     // 创建时间 (FIFO)
-	Frequency int           // 访问频率 (LFU)
-	Element   *list.Element // 指向链表节点的指针，方便快速删除
+	Key        string
+	Value      any
+	Expiration time.Time     // TTL 字段
+	Accessed   time.Time     // 最后访问时间 (LRU)
+	Created    time.Time     // 创建时间 (FIFO)
+	Frequency  int           // 访问频率 (LFU)
+	Element    *list.Element // 指向链表节点的指针，方便快速删除
 }
 
 type ShardedMap struct {
@@ -32,6 +33,15 @@ func (sm *ShardedMap) Get(key string) (any, bool) {
 		return nil, false
 	}
 
+	if !entry.Expiration.IsZero() && time.Now().After(entry.Expiration) {
+		// 已经过期，懒删除
+		if sm.policy != nil {
+			sm.policy.OnDelete(entry)
+		}
+		delete(sm.data, key)
+		return nil, false
+	}
+
 	if sm.policy != nil {
 		sm.policy.OnGet(entry)
 	}
@@ -44,6 +54,7 @@ func (sm *ShardedMap) Set(key string, value any) {
 
 	if entry, ok := sm.data[key]; ok {
 		entry.Value = value
+		entry.Expiration = time.Time{} // 更新值时默认清空 TTL
 		if sm.policy != nil {
 			sm.policy.OnSet(entry)
 		}
@@ -77,6 +88,49 @@ func (sm *ShardedMap) Delete(key string) {
 		}
 		delete(sm.data, key)
 	}
+}
+
+// SetExpire 为 key 设置 TTL
+func (sm *ShardedMap) SetExpire(key string, ttl time.Duration) bool {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	entry, ok := sm.data[key]
+	if !ok {
+		return false
+	}
+	
+	if !entry.Expiration.IsZero() && time.Now().After(entry.Expiration) {
+		if sm.policy != nil {
+			sm.policy.OnDelete(entry)
+		}
+		delete(sm.data, key)
+		return false
+	}
+	
+	entry.Expiration = time.Now().Add(ttl)
+	return true
+}
+
+// TTL 获取剩余过期时间
+func (sm *ShardedMap) TTL(key string) time.Duration {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	entry, ok := sm.data[key]
+	if !ok {
+		return -2 // Key 不存在
+	}
+	
+	if !entry.Expiration.IsZero() && time.Now().After(entry.Expiration) {
+		return -2 // 已过期
+	}
+
+	if entry.Expiration.IsZero() {
+		return -1 // 永久有效
+	}
+
+	return time.Until(entry.Expiration)
 }
 
 

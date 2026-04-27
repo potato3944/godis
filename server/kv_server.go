@@ -1,24 +1,27 @@
 package server
 
 import (
+	"fmt"
 	"net/rpc"
 
-	"predis/api"
-	"predis/cluster"
-	"predis/store"
+	"godis/api"
+	"godis/cluster"
+	"godis/store"
 )
 
 // KVServer 包装了存储引擎，提供基于 net/rpc 的外部访问
 type KVServer struct {
 	store   store.Store
 	cluster *cluster.ClusterState
+	aof     *store.AOF
 }
 
 // NewKVServer 初始化 RPC 服务器，引入动态 Gossip 集群状态
-func NewKVServer(s store.Store, c *cluster.ClusterState) *KVServer {
+func NewKVServer(s store.Store, c *cluster.ClusterState, aof *store.AOF) *KVServer {
 	return &KVServer{
 		store:   s,
 		cluster: c,
+		aof:     aof,
 	}
 }
 
@@ -58,6 +61,13 @@ func (kv *KVServer) Set(args *api.SetArgs, reply *api.SetReply) error {
 	}
 
 	kv.store.Set(args.Key, args.Value)
+	if kv.aof != nil {
+		if strVal, ok := args.Value.(string); ok {
+			kv.aof.Append("SET", args.Key, strVal)
+		} else {
+			kv.aof.Append("SET", args.Key, fmt.Sprintf("%v", args.Value))
+		}
+	}
 	reply.Success = true
 
 	// 2. 如果我有从节点，发起异步传播
@@ -73,6 +83,9 @@ func (kv *KVServer) Delete(args *api.DeleteArgs, reply *api.DeleteReply) error {
 	}
 
 	kv.store.Delete(args.Key)
+	if kv.aof != nil {
+		kv.aof.Append("DEL", args.Key)
+	}
 	reply.Success = true
 	go kv.cluster.PropagateToSlaves("DEL", args.Key, nil)
 

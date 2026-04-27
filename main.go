@@ -6,9 +6,9 @@ import (
 	"net"
 	"net/rpc"
 
-	"predis/cluster"
-	"predis/server"
-	"predis/store"
+	"godis/cluster"
+	"godis/server"
+	"godis/store"
 )
 
 func main() {
@@ -17,10 +17,23 @@ func main() {
 	joinAddr := flag.String("join", "", "你想拉手合并的现有 Gossip 节点地址")
 	maxEntries := flag.Int("max-entries", 0, "最大元素数量 (0 表示不限制)")
 	policy := flag.String("policy", "LRU", "淘汰策略 (LRU, FIFO, NONE)")
+	aofFile := flag.String("aof", "appendonly.aof", "AOF 持久化文件路径")
 	flag.Parse()
 
 	// 1. 初始化底层引擎
 	engine := store.NewConcurrentMap(*maxEntries, store.EvictionPolicyType(*policy))
+	
+	// 初始化 AOF
+	aofLogger, err := store.NewAOF(*aofFile, engine)
+	if err != nil {
+		log.Fatalf("Failed to initialize AOF: %v", err)
+	}
+	defer aofLogger.Close()
+	
+	// 尝试从 AOF 恢复数据
+	if err := aofLogger.Load(); err != nil {
+		log.Printf("Warning: Failed to load AOF data: %v", err)
+	}
 
 	// 2. 初始化核心动态集群状态机
 	clusterState := cluster.NewClusterState(*nodeId, *addr)
@@ -33,7 +46,7 @@ func main() {
 
 	// 4. 初始化两大对外服务： Gossip 节点协同服务 和 KV 查询服务
 	gossipServer := server.NewGossipServer(clusterState)
-	kvServer := server.NewKVServer(engine, clusterState)
+	kvServer := server.NewKVServer(engine, clusterState, aofLogger)
 
 	// 把两个服务注册到原生 rpc 的基础单例复用路由器上
 	gossipServer.Register()
@@ -44,7 +57,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Listen error: %v", err)
 	}
-	log.Printf("Predis Network listening on [%s] - Node ID: %s", *addr, *nodeId)
+	log.Printf("godis Network listening on [%s] - Node ID: %s", *addr, *nodeId)
 
 	go func() {
 		for {

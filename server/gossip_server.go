@@ -3,8 +3,8 @@ package server
 import (
 	"net/rpc"
 
-	"predis/api"
-	"predis/cluster"
+	"godis/api"
+	"godis/cluster"
 )
 
 type GossipServer struct {
@@ -30,4 +30,13 @@ func (gs *GossipServer) RequestVote(args *api.RequestVoteArgs, reply *api.Reques
 // Register 仅仅注册自身到默认 RPC 复用器中
 func (gs *GossipServer) Register() error {
 	return rpc.Register(gs)
+}
+
+func (gs *GossipServer) JoinCluster(addr string) error {
+	node := &cluster.ClusterNode{
+		NodeId: addr, // placeholder
+		Addr:   addr,
+	}
+	gs.cluster.ClusterSendPing(node, api.PintType_Meet)
+	return nil
 }

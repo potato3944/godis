@@ -6,18 +6,18 @@ import (
 )
 
 type CommandServer struct {
-	cs *cluster.ClusterState
+	ClusterState *cluster.ClusterState
 }
 
 
 func (cs *CommandServer) SetSlot (args *api.SetSlotArgs){
-	cs.cs.ClusterSetSlot(args)
+	cs.ClusterState.EventQueue<- &cluster.SetSlot{}
 }
 
 func (cs * CommandServer)MigrateKeys(args *api.MigrateKeysArgs ,reply *api.MigrateKeysReply){
-	cs.cs.ClusterMigrateKeys(args,reply)
+	cs.ClusterState.ClusterMigrateKeys(args,reply)
 }
 
 func (cs *CommandServer)Restore(args *api.RestoreArgs ,reply *api.RestoreReply){
-	cs.cs.ClusterRestore(args,reply)
+	cs.ClusterState.ClusterRestore(args,reply)
 }

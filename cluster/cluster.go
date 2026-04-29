@@ -95,7 +95,7 @@ const (
 )
 
 type ClusterState struct {
-	mu                sync.Mutex
+	mu                sync.RWMutex
 	Myself            *ClusterNode
 	Nodes             map[string]*ClusterNode //NodeId -> *ClusterNode
 	NodesIds          []string
@@ -112,18 +112,23 @@ type ClusterState struct {
 	FailoverAuthCount int
 	FailoverAuthSent  bool
 	LastVoteEpoch     uint64
-	EventQueue  chan Event
+	EventQueue        chan Event
 }
 
 type Event any
 
-func (cs *ClusterState) Loop(){
-	for event :=range cs.EventQueue{
-		switch e:=event.(type){
+func (cs *ClusterState) Loop() {
+	for event := range cs.EventQueue {
+		switch e := event.(type) {
 		case *ClusterSendPing:
-			cs.ClusterSendPing(e.receiver,e.typ)
+			cs.ClusterSendPing(e.receiver, e.typ)
 		case *ClusterProcessPacket:
 			cs.ClusterProcessPacket(e.Args, e.Sender)
+		case *PingPong:
+			cs.HandlePingPong(e.Args, e.Reply)
+			e.Done <- struct{}{}
+		case *SetSlot:
+			cs.ClusterSetSlot(e.Args)
 		}
 	}
 }
@@ -149,31 +154,6 @@ func NewClusterState(nodeId, addr string) *ClusterState {
 	return cs
 }
 
-
-
-// 处理 rpc
-func (cs *ClusterState) PingPong(args *api.PingArgs, reply *api.PingArgs) {
-
-	cs.mu.Lock()
-	sender := cs.Nodes[args.NodeId]
-	cs.mu.Unlock()
-
-	if args.Type == api.PingType_Ping || args.Type == api.PintType_Meet {
-		reply = cs.PreparePingArgs(sender, api.PingType_Pong)
-	}
-	cs.ClusterProcessPacket(args, sender)
-}
-
-func (cs *ClusterState) ClusterProcessConfigInfo(args *api.PingArgs, sender *ClusterNode) {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-
-	dirtySlots := args.Slots != sender.Slots
-	if dirtySlots {
-		cs.ClusterUpdateSlotsConfigWith(args.Slots, sender, args.ConfigEpoch)
-	}
-}
-
 func (cs *ClusterState) ClusterUpdateSlotsConfigWith(slots BitMap, sender *ClusterNode, senderConfigEpoch uint64) {
 	for j := range NumSlots {
 		slot := uint(j)
@@ -192,34 +172,8 @@ func (cs *ClusterState) ClusterUpdateSlotsConfigWith(slots BitMap, sender *Clust
 
 }
 
-// 处理 gossip 携带的其他节点的信息
-func (cs *ClusterState) ProcessGossipNodeInfo(sender *ClusterNode, nodes []api.GossipNodeInfo) {
-	cs.mu.Lock()
-	for _, nodeInfo := range nodes {
-		node, ok := cs.Nodes[nodeInfo.NodeId]
-		if !ok {
-			cs.Nodes[nodeInfo.NodeId] = &ClusterNode{
-				NodeId: nodeInfo.NodeId,
-				Addr:   nodeInfo.Addr,
-			}
-			cs.NodesIds = append(cs.NodesIds, nodeInfo.NodeId)
-		} else if sender != nil && nodeInfo.NodeId != cs.Myself.NodeId {
-			// 如果发送者认为该节点 PFAIL 或 FAIL
-			if (nodeInfo.Flags & (CLUSTER_NODE_PFAIL | CLUSTER_NODE_FAIL)) != 0 {
-				node.AddFailureReport(sender)
-			} else {
-				// 节点状态正常，清除对应的故障报告
-				node.DelFailureReport(sender)
-			}
-		}
-	}
-	cs.mu.Unlock()
-}
-
 // 添加 slot
 func (cs *ClusterState) ClusterAddSlot(node *ClusterNode, slot uint) bool {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
 	if cs.Slots[slot] != nil {
 		return false
 	}
@@ -230,8 +184,6 @@ func (cs *ClusterState) ClusterAddSlot(node *ClusterNode, slot uint) bool {
 
 // 删除 slot
 func (cs *ClusterState) ClusterDelSlot(slot uint) bool {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
 	node := cs.Slots[slot]
 	if node == nil {
 		return false
@@ -239,50 +191,6 @@ func (cs *ClusterState) ClusterDelSlot(slot uint) bool {
 	node.Slots.Clear(slot)
 
 	return true
-}
-
-func (cs *ClusterState) ClusterSetSlot(args *api.SetSlotArgs) {
-	switch args.Action {
-	case api.SetSlotAction_Migrate:
-		if cs.Slots[args.Slot] != cs.Myself {
-			return
-		}
-		node := cs.Nodes[args.TargetNodeId]
-		if node == nil {
-			return
-		}
-		cs.MigratingSlotTo[args.Slot] = node
-	case api.SetSlotAction_Import:
-		if cs.Slots[args.Slot] == cs.Myself {
-			return
-		}
-		node := cs.Nodes[args.TargetNodeId]
-		if node == nil {
-			return
-		}
-		cs.ImportingSlotFrom[args.Slot] = node
-	case api.SetSlotAction_Node:
-		node := cs.Nodes[args.TargetNodeId]
-		if node == nil {
-			return
-		}
-		if node != cs.Myself && cs.Slots[args.Slot] == cs.Myself {
-			if cs.CountKeysInSlot(args.Slot) != 0 {
-				return
-			}
-		}
-		if cs.CountKeysInSlot(args.Slot) == 0 && cs.MigratingSlotTo[args.Slot] != nil {
-			cs.MigratingSlotTo[args.Slot] = nil
-		}
-
-		cs.ClusterDelSlot(args.Slot)
-		cs.ClusterAddSlot(node, args.Slot)
-		if node == cs.Myself && cs.ImportingSlotFrom[args.Slot] != nil {
-			cs.ImportingSlotFrom[args.Slot] = nil
-			cs.ClusterBumpConfigEpochWithoutConsensus()
-			cs.ClusterTodo(CLUSTER_TODO_BROADCAST_PONG)
-		}
-	}
 }
 
 // GetRandomNode 从所有节点中随机获取一个节点
@@ -297,10 +205,6 @@ func (cs *ClusterState) CountKeysInSlot(slot uint) int {
 
 func (cs *ClusterState) ClusterBumpConfigEpochWithoutConsensus() bool {
 	maxEpoch := cs.ClusterGetMaxEpoch()
-
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-
 	if cs.Myself.ConfigEpoch == 0 || cs.Myself.ConfigEpoch != maxEpoch {
 		cs.CurrentEpoch++
 		cs.Myself.ConfigEpoch = cs.CurrentEpoch
@@ -405,7 +309,6 @@ func (cs *ClusterState) PropagateToSlaves(op string, key string, value interface
 		}(slave)
 	}
 }
-
 
 // IsMine 计算目标 Key 属于谁。如果无人管理默认返回自己管（降级）。
 func (cs *ClusterState) IsMine(key string) (bool, string) {
@@ -544,7 +447,7 @@ func (cs *ClusterState) HandleFailover() {
 		cs.FailoverAuthCount = 0
 
 		log.Printf("Starting failover election for epoch %d", cs.CurrentEpoch)
-		
+
 		// 复制出所有 Master 节点
 		var masters []*ClusterNode
 		for _, node := range cs.Nodes {
@@ -552,7 +455,7 @@ func (cs *ClusterState) HandleFailover() {
 				masters = append(masters, node)
 			}
 		}
-		
+
 		currentEpoch := cs.CurrentEpoch
 		configEpoch := cs.Myself.ConfigEpoch
 		cs.mu.Unlock()
@@ -634,7 +537,7 @@ func (cs *ClusterState) HandleRequestVote(args *api.RequestVoteArgs, reply *api.
 	if args.CurrentEpoch < cs.CurrentEpoch {
 		return
 	}
-	
+
 	// 更新本地的纪元
 	if args.CurrentEpoch > cs.CurrentEpoch {
 		cs.CurrentEpoch = args.CurrentEpoch

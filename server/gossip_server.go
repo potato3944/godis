@@ -18,7 +18,9 @@ func NewGossipServer(cs *cluster.ClusterState) *GossipServer {
 }
 
 func (gs *GossipServer) PingPong(args *api.PingArgs, reply *api.PingArgs) error {
-	gs.cluster.PingPong(args, reply)
+	done:=make(chan struct{})
+	gs.cluster.EventQueue<-&cluster.PingPong{Args: args,Reply: reply,Done: done}
+	<-done
 	return nil
 }
 
@@ -40,3 +42,4 @@ func (gs *GossipServer) JoinCluster(addr string) error {
 	gs.cluster.ClusterSendPing(node, api.PintType_Meet)
 	return nil
 }
+

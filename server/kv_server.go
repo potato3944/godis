@@ -71,7 +71,9 @@ func (kv *KVServer) Set(args *api.SetArgs, reply *api.SetReply) error {
 	reply.Success = true
 
 	// 2. 如果我有从节点，发起异步传播
-	go kv.cluster.PropagateToSlaves("SET", args.Key, args.Value)
+	if kv.cluster != nil {
+		go kv.cluster.PropagateToSlaves("SET", args.Key, args.Value)
+	}
 
 	return nil
 }
@@ -87,7 +89,9 @@ func (kv *KVServer) Delete(args *api.DeleteArgs, reply *api.DeleteReply) error {
 		kv.aof.Append("DEL", args.Key)
 	}
 	reply.Success = true
-	go kv.cluster.PropagateToSlaves("DEL", args.Key, nil)
+	if kv.cluster != nil {
+		go kv.cluster.PropagateToSlaves("DEL", args.Key, nil)
+	}
 
 	return nil
 }

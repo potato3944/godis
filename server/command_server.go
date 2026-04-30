@@ -21,3 +21,5 @@ func (cs * CommandServer)MigrateKeys(args *api.MigrateKeysArgs ,reply *api.Migra
 func (cs *CommandServer)Restore(args *api.RestoreArgs ,reply *api.RestoreReply){
 	cs.ClusterState.ClusterRestore(args,reply)
 }
+
+func (cs *CommandServer)
